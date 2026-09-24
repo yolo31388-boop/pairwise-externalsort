@@ -76,8 +76,8 @@ def test_disk_io_counting_large():
     assert st["disk_writes"] == 420
     # disk_reads = 每趟读回输入块数：313+79+20+5+2 = 419
     assert st["disk_reads"] == 419
-    # 比较次数 >= 输出条数（每条至少一次比较）
-    assert st["comparisons"] >= 5000
+    # 比较次数：每趟每条记录至少参与一次比较（透传块除外）
+    assert st["comparisons"] >= 5000 * (st["passes"] - 1)
 
 
 def test_empty_input():
@@ -102,8 +102,10 @@ def test_stats_fields():
     s.sort()
     st = s.stats()
     assert set(st.keys()) >= {"chunks", "passes", "comparisons",
-                              "disk_writes", "disk_reads"}
+                              "disk_writes", "disk_reads",
+                              "max_chunk_size"}
     assert st["chunks"] == 5
+    assert st["max_chunk_size"] > 0
 
 
 def test_stable_within_merge():
@@ -117,7 +119,71 @@ def test_stable_within_merge():
 def test_tiny_chunks_many_passes():
     # 每块 4 条、k=2 -> 多趟合并验证块级正确性
     s = ExternalSorter(chunk_size=4, k=2)
-    s.load([random.Random(7).randint(0, 100) for _ in range(100)])
-    data = s._pending
+    data = [random.Random(7).randint(0, 100) for _ in range(100)]
+    s.load(data)
     assert s.sort() == sorted(data)
     assert s.stats()["passes"] >= 4
+
+
+# ---------------- v3 新增 ----------------
+
+def test_key_function():
+    s = ExternalSorter(chunk_size=8)
+    s.load([(3, "c"), (1, "a"), (2, "b"), (1, "x")], key=lambda t: t[0])
+    out = s.sort()
+    assert out == [(1, "a"), (1, "x"), (2, "b"), (3, "c")]
+
+
+def test_key_abs():
+    s = ExternalSorter(chunk_size=4)
+    s.load([-3, 1, -2, 4, 0], key=abs)
+    assert s.sort() == [0, 1, -2, -3, 4]
+
+
+def test_descending():
+    s = ExternalSorter(chunk_size=8)
+    s.load([5, 3, 1, 2, 4])
+    assert s.sort(descending=True) == [5, 4, 3, 2, 1]
+
+
+def test_descending_with_key():
+    s = ExternalSorter(chunk_size=8)
+    s.load([(3, "c"), (1, "a"), (2, "b")], key=lambda t: t[1])
+    assert s.sort(descending=True) == [(3, "c"), (2, "b"), (1, "a")]
+
+
+def test_stability_same_key():
+    # 同 key 记录保持输入相对顺序
+    s = ExternalSorter(chunk_size=4, k=2)
+    s.load([(1, "a"), (1, "b"), (0, "c"), (1, "d"), (0, "e")],
+           key=lambda t: t[0])
+    out = s.sort()
+    keys = [k for k, _ in out]
+    assert keys == [0, 0, 1, 1, 1]
+    # 同 key 组内相对顺序与输入一致
+    assert out[2:] == [(1, "a"), (1, "b"), (1, "d")]
+
+
+def test_objects_by_attr():
+    class Rec:
+        def __init__(self, name, age):
+            self.name = name
+            self.age = age
+
+        def __repr__(self):
+            return self.name
+
+    s = ExternalSorter(chunk_size=4)
+    recs = [Rec("bob", 30), Rec("amy", 25), Rec("zoe", 28)]
+    s.load(recs, key=lambda r: r.age)
+    out = s.sort()
+    assert [r.name for r in out] == ["amy", "zoe", "bob"]
+
+
+def test_comparison_bound_multipass():
+    # 每趟每条记录至少比较一次（透传块除外）：comparisons >= n*(passes-1)
+    s = ExternalSorter(chunk_size=16, k=4)
+    s.load(list(range(4999, -1, -1)))
+    s.sort()
+    st = s.stats()
+    assert st["comparisons"] >= 5000 * (st["passes"] - 1)

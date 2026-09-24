@@ -1,5 +1,5 @@
 实现一个外部 k 路归并排序（内存受限模拟，含显式磁盘块管理与
-IO 统计），只用 Python 标准库。
+IO 统计），支持 key 排序函数、降序与稳定性，只用 Python 标准库。
 
 背景：externalsort.py 是骨架（ExternalSorter 类方法 raise
 NotImplementedError），tests/test_externalsort.py 是验收测试。
@@ -7,32 +7,42 @@ NotImplementedError），tests/test_externalsort.py 是验收测试。
 需求（feature，仿大数据外排序 + 外存管理核心语义）：
 1. ExternalSorter(chunk_size, k)：内存一次最多 hold chunk_size 条
    记录；k 为每趟归并最大路数（默认 4）
-2. load(data)：登记待排序数据流（本阶段不排序、不全部驻留内存）
-3. flush()：把已登记数据按 chunk_size 切成有序块写入 chunks
-   （内存 list 模拟磁盘块），每写一块 disk_writes+1；清空缓冲
+2. load(data, key=None)：登记数据流（本阶段不排序）；key 为可选
+   排序键函数——元素可以是任意可比较对象（元组、自定义对象），
+   按 key(item) 排序；key 为 None 时按元素本身
+3. flush()：把已登记数据按 chunk_size 切成块，每块按 key（或元素
+   本身）升序排序后写入 chunks（内存 list 模拟磁盘块），每写一块
+   disk_writes+1；清空缓冲
 4. merge_once() -> bool：对当前块集执行一趟 k 路归并：
    - 按顺序每 k 块一组：用最小堆维护各块游标，逐条取出全局最小
-     归并成 1 块（组内仅 1 块时直接透传）
+     归并成 1 块（组内仅 1 块时直接透传，透传不产生比较）
+   - 稳定性：同 key 的记录取组序靠前的块（输入相对顺序保持）
    - 读回每个输入块 disk_reads+1，写出每个输出块 disk_writes+1
    - 当前块数 > 1 时返回 True（还有下一趟），否则 False
-5. sort()：先 flush 全部，再反复 merge_once 直到只剩 1 块，
-   返回全排序结果（元素一个不丢）
+5. sort(descending=False)：先 flush 全部，再反复 merge_once 直到
+   只剩 1 块，返回全排序结果（元素一个不丢）；descending=True 时
+   全序列降序（块内排序与归并取最大值都反转）
 6. stats() -> {chunks, passes, comparisons, disk_writes,
-   disk_reads}：
+   disk_reads, max_chunk_size}：
    - chunks：初始落盘块数（归并后保持不变）
    - passes：merge_once 调用趟数
-   - comparisons：归并中取最小值时的比较次数（每条输出至少计 1）
+   - comparisons：归并中取最小值时的比较次数（透传块不计）
    - disk_writes / disk_reads：按上述规则精确累计
+   - max_chunk_size：当前最大块的记录数
 
 验收：
 - python -m pytest tests/test_externalsort.py -q 全绿
 - 覆盖：单块（writes=1, reads=0）/200 条 4 块/500 条递减/重复值
   不丢/20 块 k=4 多趟（passes>=2）/显式 flush+merge 手动归并/
-  5000 条 chunk=16 k=4 精确 IO 统计（313 块、5 趟、
-  writes=420、reads=419、comparisons>=5000）/空输入/随机 1000 条
-  对照 sorted/统计字段/每块 4 条 k=2 多趟
+  5000 条 chunk=16 k=4 精确 IO 统计（313 块、5 趟、writes=420、
+  reads=419、comparisons>=5000*4）/空输入/随机 1000 条对照
+  sorted/统计字段含 max_chunk_size/每块 4 条 k=2 多趟/key 函数
+  （元组按第一元素、abs 排序）/降序/降序+key 组合/同 key 稳定性
+  （输入相对顺序保持）/自定义对象按属性排序/比较次数上界
+  （comparisons>=n*(passes-1)）
 
 要求：
-- 只 import 标准库；必须真实"分块落盘 + k 路堆归并 + 多趟"
-  （不能把全部数据 load 进内存后整体 sorted，测试会断言
-  chunks/passes/IO 计数）；别改测试
+- 只 import 标准库；必须真实"分块落盘 + k 路堆归并 + 多趟"（不能
+  把全部数据 load 进内存后整体 sorted，测试会断言
+  chunks/passes/IO 计数；key 必须贯穿块内排序与归并比较，稳定性
+  必须真实保持）；别改测试
