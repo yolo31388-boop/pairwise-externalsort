@@ -1,48 +1,52 @@
-实现一个外部 k 路归并排序（内存受限模拟，含显式磁盘块管理与
-IO 统计），支持 key 排序函数、降序与稳定性，只用 Python 标准库。
+实现一个真实磁盘文件版的外部 k 路归并排序，只用 Python 标准库。
 
 背景：externalsort.py 是骨架（ExternalSorter 类方法 raise
 NotImplementedError），tests/test_externalsort.py 是验收测试。
 
-需求（feature，仿大数据外排序 + 外存管理核心语义）：
-1. ExternalSorter(chunk_size, k)：内存一次最多 hold chunk_size 条
-   记录；k 为每趟归并最大路数（默认 4）
-2. load(data, key=None)：登记数据流（本阶段不排序）；key 为可选
-   排序键函数——元素可以是任意可比较对象（元组、自定义对象），
-   按 key(item) 排序；key 为 None 时按元素本身
-3. flush()：把已登记数据按 chunk_size 切成块，每块按 key（或元素
-   本身）升序排序后写入 chunks（内存 list 模拟磁盘块），每写一块
-   disk_writes+1；清空缓冲
-4. merge_once() -> bool：对当前块集执行一趟 k 路归并：
-   - 按顺序每 k 块一组：用最小堆维护各块游标，逐条取出全局最小
-     归并成 1 块（组内仅 1 块时直接透传，透传不产生比较）
-   - 稳定性：同 key 的记录取组序靠前的块（输入相对顺序保持）
-   - 读回每个输入块 disk_reads+1，写出每个输出块 disk_writes+1
-   - 当前块数 > 1 时返回 True（还有下一趟），否则 False
+需求（feature，仿大数据外排序真实落盘语义）：
+1. ExternalSorter(block_size, k, workdir)：block_size 为每个 run
+   文件的目标字节预算（按字节切块，不是按条数）；k 为每趟归并
+   最大路数（默认 4）；workdir 指定临时目录，None 时自动创建
+   临时目录并在 sort 结束后整体清理
+2. load(iterable, key=None)：登记数据流——任意可迭代对象（含
+   生成器）；元素类型为 int 或 str（同批统一）；key 为可选排序
+   键函数（元素按 key(item) 排序，key 为 None 按元素本身）
+3. flush()：把数据按 key 稳定升序排序后，按字节预算切成多个
+   run；每个 run 序列化为一个真实临时文件 run_N.bin 写入 workdir
+   （序列化编码格式自定，必须可完整 roundtrip：int 与 str 都要
+   支持）；每写一个文件 disk_writes+1、disk_bytes 累加写入字节
+4. merge_once() -> bool：对当前 run 文件执行一趟 k 路归并：
+   - 按顺序每 k 个 run 一组：打开文件逐条读回（decode），用最小
+     堆逐条取全局最小归并成 1 个新 run 文件（组内仅 1 个 run 时
+     直接保留）
+   - 稳定性：同 key 的记录取组序靠前的 run（输入相对顺序保持）
+   - 每读回一个输入 run disk_reads+1；消费完的输入文件立即删除
+     （files_cleaned+1）
+   - 当前 run 数 > 1 时返回 True（还有下一趟），否则 False
 5. sort(descending=False)：先 flush 全部，再反复 merge_once 直到
-   只剩 1 块，返回全排序结果（元素一个不丢）；descending=True 时
-   全序列降序（块内排序与归并取最大值都反转）
-6. stats() -> {chunks, passes, comparisons, disk_writes,
-   disk_reads, max_chunk_size}：
-   - chunks：初始落盘块数（归并后保持不变）
+   只剩 1 个 run，读回全量返回（元素一个不丢）；结束后删除全部
+   临时文件（含最终 run）；descending=True 时全序列降序（块内
+   排序与归并取最大值都反转）
+6. stats() -> {runs, passes, comparisons, disk_writes, disk_reads,
+   disk_bytes, files_cleaned}：
+   - runs：初始落盘 run 文件数
    - passes：merge_once 调用趟数
-   - comparisons：归并中取最小值时的比较次数（透传块不计）
-   - disk_writes / disk_reads：按上述规则精确累计
-   - max_chunk_size：当前最大块的记录数
+   - comparisons：归并取最小值时的比较次数
+   - disk_writes / disk_reads / disk_bytes / files_cleaned 按上述
+     规则精确累计
 
 验收：
 - python -m pytest tests/test_externalsort.py -q 全绿
-- 覆盖：单块（writes=1, reads=0）/200 条 4 块/500 条递减/重复值
-  不丢/20 块 k=4 多趟（passes>=2）/显式 flush+merge 手动归并/
-  5000 条 chunk=16 k=4 精确 IO 统计（313 块、5 趟、writes=420、
-  reads=419、comparisons>=5000*4）/空输入/随机 1000 条对照
-  sorted/统计字段含 max_chunk_size/每块 4 条 k=2 多趟/key 函数
-  （元组按第一元素、abs 排序）/降序/降序+key 组合/同 key 稳定性
-  （输入相对顺序保持）/自定义对象按属性排序/比较次数上界
-  （comparisons>=n*(passes-1)）
+- 覆盖：单 run 不归并（passes=0、结束后目录清空）/多 run int
+  排序/500 条递减/重复值不丢/多趟归并（passes>=2）/flush 后磁盘
+  上真实存在多个非空 run 文件、sort 后全部清理/str 记录排序/
+  生成器输入/空输入（无文件残留）/key 函数（abs）+ 稳定性（同
+   key 保持输入相对顺序）/降序/3000 条随机 roundtrip（runs>=10、
+   disk_bytes>0、files_cleaned>=runs）/统计字段齐全/自动 workdir
+  创建与清理/显式 flush+手动 merge 后目录剩 1 个 run
 
 要求：
-- 只 import 标准库；必须真实"分块落盘 + k 路堆归并 + 多趟"（不能
-  把全部数据 load 进内存后整体 sorted，测试会断言
-  chunks/passes/IO 计数；key 必须贯穿块内排序与归并比较，稳定性
-  必须真实保持）；别改测试
+- 只 import 标准库；必须真实"落盘 + 读回 + 归并"（禁止把全部
+  数据驻留内存后整体 sorted 冒充外排序，测试会断言 run 文件真实
+  存在、字节预算生效、文件被清理）；序列化必须 roundtrip int
+  与 str；别改测试
